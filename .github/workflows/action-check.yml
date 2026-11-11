@@ -1,0 +1,22 @@
+# Smoke test for the published Action reference itself:
+#   uses: RakTikoo/expiry-radar@v0.2
+# The composite Action fails the job on any finding (expired or
+# expiring). This repo's artefacts were fixed on 2026-11-11 (cert to
+# 2036, JWT to 2035), so a green run here proves the @v0.2 reference
+# resolves, the Action executes on a real runner, and the scan of this
+# repo is clean. Manual dispatch only — the weekly living-issue
+# workflow lives in expiry-radar.yml.
+name: Action reference check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  action-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: RakTikoo/expiry-radar@v0.2
