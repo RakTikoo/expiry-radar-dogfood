@@ -1,0 +1,133 @@
+# Expiry Radar — weekly scheduled scan that keeps ONE tracking issue fresh.
+#
+# Copy to .github/workflows/expiry-radar.yml in your repo.
+# Behaviour:
+#   * runs every Monday 09:00 UTC (and on demand via workflow_dispatch)
+#   * scans the repo ONCE with the Expiry Radar CLI (stdlib-only Python),
+#     in JSON form; the text report in the issue is rendered from that
+#     same JSON, so the two formats can never disagree
+#   * a scanner exit code above 2 (3 = usage error) fails the workflow
+#     as a broken invocation — it is never treated as findings
+#   * opens a single issue labelled "expiry-radar" and titled
+#     "⏰ Expiry Radar" if findings appear, updates that same issue on
+#     later runs (never opens duplicates), and comments + closes it
+#     when the repo is clean again.
+#
+# Requires: permissions issues: write (below). Uses the built-in
+# GITHUB_TOKEN via the gh CLI that ships on GitHub-hosted runners.
+#
+# NOTE: this workflow has NOT been executed on GitHub yet (the project
+# is a local pre-release build) — smoke-test it on a real repo before
+# relying on it.
+
+name: Expiry Radar
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+# One run of this workflow per repo at a time: a manual dispatch can
+# never race the scheduled run into opening a duplicate issue.
+concurrency:
+  group: expiry-radar
+  cancel-in-progress: false
+
+jobs:
+  expiry-radar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      # Replace this step's command with the published action once the
+      # repo is public; for a vendored copy, check expiry_radar.py into
+      # your repo and run it directly as shown.
+      - name: Run Expiry Radar (single run, JSON)
+        id: scan
+        run: |
+          set +e
+          python3 expiry_radar.py . --json > expiry-radar.json
+          code=$?
+          set -e
+          echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -gt 2 ]; then
+            echo "::error::Expiry Radar usage error (exit $code) — broken invocation, not findings."
+            exit "$code"
+          fi
+          # Render the human-readable report from the same JSON run.
+          python3 - <<'PYEOF'
+          import json
+          with open("expiry-radar.json") as fh:
+              report = json.load(fh)
+          lines = [
+              f"Expiry Radar {report['version']} — as of {report['now']}, "
+              f"warning window {report['days']}d, "
+              f"files scanned: {report['files_scanned']}",
+              "",
+          ]
+          for f in report["findings"]:
+              lines.append(
+                  f"[{f['status'].upper()}] {f['kind']} "
+                  f"{f['path']}:{f['line']}  expires {f['expires']} "
+                  f"({f['days_left']:+d}d)  {f['detail']}")
+          if not report["findings"]:
+              lines.append("No expired or expiring artefacts found.")
+          s = report["summary"]
+          lines += [
+              "",
+              f"Summary: {s['expired']} expired, {s['expiring']} expiring, "
+              f"{s['safe']} safe, {s['unscanned']} unscanned, "
+              f"{s['warnings']} warnings",
+          ]
+          for item in report["unscanned"]:
+              lines.append(f"Unscanned: {item['path']}: {item['reason']}")
+          for warning in report["warnings"]:
+              lines.append(f"Warning: {warning}")
+          with open("expiry-radar-report.txt", "w") as fh:
+              fh.write("\n".join(lines) + "\n")
+          PYEOF
+
+      - name: Open or update the ⏰ Expiry Radar issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="⏰ Expiry Radar"
+          label="expiry-radar"
+          gh label create "$label" --description "Expiry Radar tracking issue" --force
+          # Find the existing open tracking issue BY LABEL (title text
+          # alone is fragile); raised --limit so busy repos don't hide it.
+          number=$(gh issue list --state open --label "$label" --limit 1000 \
+            --json number,title \
+            --jq "[.[] | select(.title == \"$title\")][0].number // empty")
+          if [ "${{ steps.scan.outputs.exit-code }}" = "0" ]; then
+            if [ -n "$number" ]; then
+              gh issue comment "$number" --body "✅ Expiry Radar is clean as of $(date -u +%F). Closing."
+              gh issue close "$number"
+            fi
+            echo "Clean — no issue needed."
+            exit 0
+          fi
+          {
+            echo "Expiry Radar found artefacts that are expired or expiring soon."
+            echo
+            echo '```'
+            cat expiry-radar-report.txt
+            echo '```'
+            echo
+            echo "_Updated by the weekly Expiry Radar workflow — this is the single tracking issue; it is edited in place, not duplicated._"
+          } > issue-body.md
+          if [ -n "$number" ]; then
+            gh issue edit "$number" --body-file issue-body.md
+            echo "Updated issue #$number"
+          else
+            gh issue create --title "$title" --label "$label" --body-file issue-body.md
+            echo "Created the tracking issue"
+          fi
