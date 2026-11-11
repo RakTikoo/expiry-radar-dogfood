@@ -1,0 +1,1 @@
+"""Consumer-sim application module."""
